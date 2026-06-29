@@ -1,17 +1,19 @@
 #![no_std]
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env};
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+const BUMP_THRESHOLD: u32 = 8_640;  // ~12 hours at 5 s/ledger
+const BUMP_AMOUNT: u32   = 17_280;  // ~24 hours at 5 s/ledger
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum RiskTier {
-    A, // 800–850 — Excellent
-    B, // 740–799 — Very Good
-    C, // 670–739 — Good
-    D, // 580–669 — Fair
-    F, // 300–579 — Poor
+    A, // 800-850 — Excellent
+    B, // 740-799 — Very Good
+    C, // 670-739 — Good
+    D, // 580-669 — Fair
+    F, // 300-579 — Poor
 }
 
 #[contracttype]
@@ -32,9 +34,18 @@ pub enum DataKey {
     Admin,
 }
 
+// ── Events ────────────────────────────────────────────────────────────────────
+
+// Emitted each time update_score writes a new profile.
+// Topics: ["CreditRls", "score_up"] — both fit within the 9-char symbol limit.
+#[contractevent(topics = ["CreditRls", "score_up"], data_format = "single-value")]
+struct ScoreUpdated {
+    score: u32,
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn score_to_tier(score: u32) -> RiskTier {
+pub fn score_to_tier(score: u32) -> RiskTier {
     match score {
         800..=850 => RiskTier::A,
         740..=799 => RiskTier::B,
@@ -68,6 +79,9 @@ impl CreditScoreContract {
             "already initialized"
         );
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
     }
 
     /// Admin-only: write a new score for a wallet after indexer computation.
@@ -79,8 +93,8 @@ impl CreditScoreContract {
             .expect("not initialized");
         admin.require_auth();
 
-        assert!((300..=850).contains(&score), "score must be 300–850");
-        assert!(percentile <= 100, "percentile must be 0–100");
+        assert!((300..=850).contains(&score), "score must be 300-850");
+        assert!(percentile <= 100, "percentile must be 0-100");
 
         let tier = score_to_tier(score);
         let max_loan = tier_to_max_loan(&tier);
@@ -95,9 +109,16 @@ impl CreditScoreContract {
             updated_ledger: env.ledger().sequence(),
         };
 
+        let key = DataKey::Profile(wallet);
+        env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
-            .set(&DataKey::Profile(wallet), &profile);
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        ScoreUpdated { score }.publish(&env);
     }
 
     /// Public read — anyone can verify a wallet's on-chain credit profile.
@@ -113,56 +134,4 @@ impl CreditScoreContract {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::Env;
-
-    #[test]
-    fn test_score_tiers() {
-        assert_eq!(score_to_tier(850), RiskTier::A);
-        assert_eq!(score_to_tier(742), RiskTier::B);
-        assert_eq!(score_to_tier(700), RiskTier::C);
-        assert_eq!(score_to_tier(620), RiskTier::D);
-        assert_eq!(score_to_tier(400), RiskTier::F);
-    }
-
-    #[test]
-    fn test_update_and_get_score() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, CreditScoreContract);
-        let client = CreditScoreContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let wallet = Address::generate(&env);
-
-        client.initialize(&admin);
-        client.update_score(&wallet, &742, &81);
-
-        let profile = client.get_score(&wallet).unwrap();
-        assert_eq!(profile.score, 742);
-        assert_eq!(profile.risk_tier, RiskTier::B);
-        assert!(profile.loan_eligible);
-        assert_eq!(profile.max_loan_usdc, 12_500);
-        assert_eq!(profile.percentile, 81);
-    }
-
-    #[test]
-    #[should_panic(expected = "score must be 300–850")]
-    fn test_invalid_score_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, CreditScoreContract);
-        let client = CreditScoreContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let wallet = Address::generate(&env);
-
-        client.initialize(&admin);
-        client.update_score(&wallet, &999, &50);
-    }
-}
+mod test;

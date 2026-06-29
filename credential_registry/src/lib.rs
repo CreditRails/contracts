@@ -1,6 +1,8 @@
 #![no_std]
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, BytesN, Env, String};
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String};
+const BUMP_THRESHOLD: u32 = 8_640;  // ~12 hours at 5 s/ledger
+const BUMP_AMOUNT: u32   = 17_280;  // ~24 hours at 5 s/ledger
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -19,9 +21,23 @@ pub struct Credential {
 
 #[contracttype]
 pub enum DataKey {
-    Credential(String),    // credential_id → Credential
-    WalletLatest(Address), // wallet → latest credential_id
+    Credential(String),    // credential_id -> Credential
+    WalletLatest(Address), // wallet -> latest credential_id
     Admin,
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
+// Emitted when a new credential is anchored on-chain.
+#[contractevent(topics = ["CreditRls", "cred_reg"], data_format = "single-value")]
+struct CredentialRegistered {
+    score: u32,
+}
+
+// Emitted when a credential is revoked by the admin.
+#[contractevent(topics = ["CreditRls", "cred_rev"], data_format = "single-value")]
+struct CredentialRevoked {
+    score: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -38,6 +54,9 @@ impl CredentialRegistry {
             "already initialized"
         );
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
     }
 
     /// Admin-only: anchor a new credential on-chain after issuance.
@@ -58,7 +77,7 @@ impl CredentialRegistry {
             .expect("not initialized");
         admin.require_auth();
 
-        assert!((300..=850).contains(&score), "score must be 300–850");
+        assert!((300..=850).contains(&score), "score must be 300-850");
         assert!(
             expires_ledger > env.ledger().sequence(),
             "expiry must be in the future"
@@ -74,12 +93,23 @@ impl CredentialRegistry {
             revoked: false,
         };
 
+        let cred_key = DataKey::Credential(credential_id.clone());
+        env.storage().persistent().set(&cred_key, &cred);
         env.storage()
             .persistent()
-            .set(&DataKey::Credential(credential_id.clone()), &cred);
+            .extend_ttl(&cred_key, BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        let wallet_key = DataKey::WalletLatest(wallet);
+        env.storage().persistent().set(&wallet_key, &credential_id);
         env.storage()
             .persistent()
-            .set(&DataKey::WalletLatest(wallet), &credential_id);
+            .extend_ttl(&wallet_key, BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        env.storage()
+            .instance()
+            .extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        CredentialRegistered { score }.publish(&env);
     }
 
     /// Admin-only: revoke a credential (e.g. score was fraudulently inflated).
@@ -98,19 +128,23 @@ impl CredentialRegistry {
             .expect("credential not found");
 
         cred.revoked = true;
+
+        let key = DataKey::Credential(credential_id);
+        env.storage().persistent().set(&key, &cred);
         env.storage()
             .persistent()
-            .set(&DataKey::Credential(credential_id), &cred);
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        CredentialRevoked { score: cred.score }.publish(&env);
     }
 
     /// Public: returns true if the credential exists, is not revoked, and has not expired.
     pub fn verify(env: Env, credential_id: String) -> bool {
-        let cred: Option<Credential> = env
+        match env
             .storage()
             .persistent()
-            .get(&DataKey::Credential(credential_id));
-
-        match cred {
+            .get::<_, Credential>(&DataKey::Credential(credential_id))
+        {
             None => false,
             Some(c) => !c.revoked && env.ledger().sequence() <= c.expires_ledger,
         }
@@ -140,58 +174,4 @@ impl CredentialRegistry {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Bytes, Env, String};
-
-    fn dummy_hash(env: &Env) -> BytesN<32> {
-        BytesN::from_array(env, &[0u8; 32])
-    }
-
-    #[test]
-    fn test_register_and_verify() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, CredentialRegistry);
-        let client = CredentialRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let wallet = Address::generate(&env);
-        let cred_id = String::from_str(&env, "cred-stellar-742-20260619");
-
-        client.initialize(&admin);
-        client.register(&wallet, &cred_id, &742, &1_000_000, &dummy_hash(&env));
-
-        assert!(client.verify(&cred_id));
-
-        let cred = client.get_credential(&cred_id).unwrap();
-        assert_eq!(cred.score, 742);
-        assert!(!cred.revoked);
-
-        let latest = client.get_latest(&wallet).unwrap();
-        assert_eq!(latest.score, 742);
-    }
-
-    #[test]
-    fn test_revoke() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, CredentialRegistry);
-        let client = CredentialRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let wallet = Address::generate(&env);
-        let cred_id = String::from_str(&env, "cred-abc");
-
-        client.initialize(&admin);
-        client.register(&wallet, &cred_id, &700, &1_000_000, &dummy_hash(&env));
-        assert!(client.verify(&cred_id));
-
-        client.revoke(&cred_id);
-        assert!(!client.verify(&cred_id));
-    }
-}
+mod test;
