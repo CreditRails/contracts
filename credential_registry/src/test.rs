@@ -94,3 +94,48 @@ fn test_revoke_nonexistent_panics() {
     client.initialize(&admin);
     client.revoke(&String::from_str(&env, "does-not-exist"));
 }
+
+#[test]
+#[should_panic]
+fn test_register_without_admin_auth_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CredentialRegistry, ());
+    let client = CredentialRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    client.initialize(&admin);
+
+    // No auth mocked for this call — proves register is actually gated
+    // by admin.require_auth(), not just producing correct output when
+    // auth happens to be mocked.
+    env.set_auths(&[]);
+    client.register(
+        &wallet,
+        &String::from_str(&env, "cred-unauth"),
+        &700,
+        &1_000_000,
+        &dummy_hash(&env),
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_revoke_without_admin_auth_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CredentialRegistry, ());
+    let client = CredentialRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    let cred_id = String::from_str(&env, "cred-abc");
+    client.initialize(&admin);
+    client.register(&wallet, &cred_id, &700, &1_000_000, &dummy_hash(&env));
+
+    env.set_auths(&[]);
+    client.revoke(&cred_id);
+}

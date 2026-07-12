@@ -78,3 +78,23 @@ fn test_double_initialize_rejected() {
     client.initialize(&admin);
     client.initialize(&admin); // should panic
 }
+
+#[test]
+#[should_panic]
+fn test_update_score_without_admin_auth_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CreditScoreContract, ());
+    let client = CreditScoreContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    client.initialize(&admin);
+
+    // No auth mocked for this call — proves update_score is actually
+    // gated by admin.require_auth(), not just producing correct output
+    // when auth happens to be mocked.
+    env.set_auths(&[]);
+    client.update_score(&wallet, &700, &50);
+}
